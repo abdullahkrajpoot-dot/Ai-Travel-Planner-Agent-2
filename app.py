@@ -426,20 +426,14 @@ def build_day_images(day_places: list[str], destination: str, used_urls: set) ->
                 images_with_names.append({"path": fallback, "name": place})
     
     # Fill remaining slots with destination fallback
-    while len(images_with_names) < 3:
+    while len(images_with_names) < 4:
         fallback = get_fallback_image(destination, used_urls)
         if fallback:
-            images_with_names.append({"path": fallback, "name": f"{destination} scenic view"})
+            images_with_names.append({"path": fallback, "name": destination})
         else:
-            break
-    
-    # 100% guarantee: Create placeholders if still not enough images
-    idx = 0
-    while len(images_with_names) < 3:
-        place = day_places[idx % len(day_places)] if day_places else destination
-        placeholder = create_placeholder_image(destination, place)
-        images_with_names.append({"path": placeholder, "name": place})
-        idx += 1
+            # Absolute last resort: Placeholder
+            placeholder = create_placeholder_image(destination, destination)
+            images_with_names.append({"path": placeholder, "name": destination})
     
     return images_with_names
 
@@ -720,19 +714,21 @@ class TravelPDF(FPDF):
         self.cell(0, 10, f"Page {self.page_no()}", align="R")
 
     def draw_timeline(self, y_start, y_end):
-        """Draw a vertical line on the left with a circle."""
-        self.set_draw_color(200, 200, 200)
-        self.set_line_width(0.5)
+        """Draw a vertical line on the left with a calendar icon."""
+        self.set_draw_color(220, 220, 220)
+        self.set_line_width(0.4)
         self.line(25, y_start, 25, y_end)
         
-        # Draw a small circle at the start of the day
+        # Draw a circle for the icon
+        self.set_draw_color(100, 116, 139) # Slate color
+        self.set_line_width(0.6)
         self.set_fill_color(255, 255, 255)
-        self.set_draw_color(100, 100, 100)
-        self.circle(23, y_start + 2, 4, style="FD")
+        self.circle(25, y_start + 1, 6, style="FD")
         
-        # Draw a tiny calendar icon or dot inside the circle
-        self.set_fill_color(100, 100, 100)
-        self.rect(24, y_start + 3.5, 2, 2, style="F")
+        # Calendar icon representation
+        self.set_draw_color(100, 116, 139)
+        self.rect(22.5, y_start - 0.5, 5, 4, style="D")
+        self.line(22.5, y_start + 0.5, 27.5, y_start + 0.5)
 
 
 def create_pdf(itinerary: dict, day_images: dict) -> bytes:
@@ -741,11 +737,7 @@ def create_pdf(itinerary: dict, day_images: dict) -> bytes:
     destination = itinerary.get("destination", "Destination")
     days = itinerary.get("days", [])
     
-    # Calculate total pages (estimate)
-    total_days = len(days)
-    
     pdf = TravelPDF(customer)
-    pdf.total_pages = total_days + 2  # Cover + Summary + Days
     pdf.set_auto_page_break(auto=True, margin=20)
     
     # --- Page 1: COVER PAGE ---
@@ -756,9 +748,7 @@ def create_pdf(itinerary: dict, day_images: dict) -> bytes:
     pdf.cell(0, 10, safe_text(customer.upper()), ln=True, align="C")
     pdf.ln(10)
     
-    # Large Cover Image
     cover_image = None
-    # Try to find a good cover image from the first day
     if day_images.get(0):
         cover_image = day_images[0][0]["path"]
     
@@ -796,96 +786,84 @@ def create_pdf(itinerary: dict, day_images: dict) -> bytes:
         pdf.ln(2)
         
     y_summary_end = pdf.get_y()
-    # Draw a faint vertical line for summary
     pdf.set_draw_color(220, 220, 220)
     pdf.line(25, y_summary_start, 25, y_summary_end)
     
     # --- DAY PAGES ---
-    
-    # Day pages
     for i, day in enumerate(days):
         pdf.add_page()
         y_day_start = pdf.get_y()
         
-        # Date Header (Large, Bold, with Line)
         pdf.set_font("Helvetica", "B", 18)
         pdf.set_text_color(50, 50, 50)
         pdf.set_x(15)
-        date_str = day.get("date_display", f"Day {i+1}")
-        pdf.cell(0, 15, safe_text(date_str))
-        
-        # Horizontal line across the page
+        pdf.cell(0, 15, safe_text(day.get("date_display", f"Day {i+1}")))
         pdf.set_draw_color(220, 230, 240)
         pdf.line(15, pdf.get_y() + 12, 195, pdf.get_y() + 12)
         pdf.ln(20)
         
-        # Content with timeline sidebar
-        content_x = 35
-        pdf.set_x(content_x)
-        
-        # Title
-        pdf.set_font("Helvetica", "B", 12)
-        pdf.set_text_color(0, 0, 0)
-        pdf.cell(0, 8, safe_text(day.get("title", "")), ln=True)
-        pdf.ln(2)
-        
-        # Activities with bullet points
-        pdf.set_font("Helvetica", "", 10)
+        # Activity Sections
+        pdf.set_font("Helvetica", "", 11)
         pdf.set_text_color(60, 60, 60)
         
-        # Morning
-        pdf.set_x(content_x)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.write(6, "- Morning: ")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.write(6, f"{safe_text(day.get('morning', ''))}\n")
+        sections = [
+            ("Morning", day.get("morning", "")),
+            ("Afternoon", day.get("afternoon", "")),
+            ("Evening", day.get("evening", ""))
+        ]
         
-        # Afternoon
-        pdf.set_x(content_x)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.write(6, "- Afternoon: ")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.write(6, f"{safe_text(day.get('afternoon', ''))}\n")
-        
-        # Evening
-        pdf.set_x(content_x)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.write(6, "- Evening: ")
-        pdf.set_font("Helvetica", "", 10)
-        pdf.write(6, f"{safe_text(day.get('evening', ''))}\n")
-        pdf.ln(8)
-        
-        # Image grid (Mosaic: 1 large, 2 small)
-        images = day_images.get(i, [])
-        if images:
-            y_img_start = pdf.get_y()
+        def write_activity_text(label, text, places):
+            pdf.set_font("Helvetica", "B", 11)
+            pdf.set_text_color(51, 65, 85)
+            pdf.set_draw_color(30, 64, 175)
+            pdf.set_fill_color(30, 64, 175)
+            pdf.circle(32, pdf.get_y() + 2.5, 0.8, style="FD")
             
-            # Left large image
+            pdf.set_x(35)
+            pdf.write(6, f" {label}: ")
+            
+            pdf.set_font("Helvetica", "", 11)
+            pdf.set_text_color(71, 85, 105)
+            
+            words = text.split()
+            for word in words:
+                clean_word = re.sub(r'[^a-zA-Z]', '', word)
+                is_landmark = any(p.lower().startswith(clean_word.lower()) for p in places if len(clean_word) > 3)
+                
+                if is_landmark:
+                    pdf.set_text_color(37, 99, 235)
+                    pdf.write(6, word + " ")
+                    pdf.set_text_color(71, 85, 105)
+                else:
+                    pdf.write(6, word + " ")
+            pdf.ln(8)
+
+        for label, text in sections:
+            write_activity_text(label, text, day.get("places", []))
+            
+        pdf.ln(5)
+        
+        # Image Grid (4-image Mosaic)
+        images = day_images.get(i, [])
+        if images and len(images) >= 4:
+            content_x = 35
+            y_img_start = pdf.get_y()
+            grid_w = 160
             img_large_w = 100
             img_large_h = 70
-            if len(images) > 0:
-                try:
-                    pdf.image(images[0]["path"], x=content_x, y=y_img_start, w=img_large_w, h=img_large_h)
-                except: pass
+            gap = 2
+            img_sm_w = (grid_w - img_large_w - 2 * gap) / 2
+            img_sm_h = (img_large_h - gap) / 2
             
-            # Right two small images
-            img_small_w = 55
-            img_small_h = 33
-            gap = 4
-            
-            if len(images) > 1:
-                try:
-                    pdf.image(images[1]["path"], x=content_x + img_large_w + gap, y=y_img_start, w=img_small_w, h=img_small_h)
-                except: pass
-            
-            if len(images) > 2:
-                try:
-                    pdf.image(images[2]["path"], x=content_x + img_large_w + gap, y=y_img_start + img_small_h + gap, w=img_small_w, h=img_small_h)
-                except: pass
+            try:
+                pdf.image(images[0]["path"], x=content_x, y=y_img_start, w=img_large_w, h=img_large_h)
+                pdf.image(images[1]["path"], x=content_x + img_large_w + gap, y=y_img_start, w=img_sm_w, h=img_sm_h)
+                pdf.image(images[2]["path"], x=content_x + img_large_w + gap, y=y_img_start + img_sm_h + gap, w=img_sm_w, h=img_sm_h)
+                pdf.image(images[3]["path"], x=content_x + img_large_w + img_sm_w + 2 * gap, y=y_img_start, w=img_sm_w, h=img_large_h)
+            except: pass
             
             pdf.set_y(y_img_start + img_large_h + 10)
         
-        # Draw the vertical timeline line for the whole day section
         y_day_end = pdf.get_y()
         pdf.draw_timeline(y_day_start + 18, y_day_end)
     
