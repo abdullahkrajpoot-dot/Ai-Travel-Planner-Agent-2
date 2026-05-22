@@ -1,983 +1,984 @@
-"""
-AI Travel Planner - Professional PDF Generation
-Generates day-by-day travel itineraries with verified images and professional PDF layout.
-"""
-
-import json
+import hashlib
 import os
 import re
 import tempfile
+import time
 import unicodedata
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta
 from io import BytesIO
-from pathlib import Path
-import threading
+from urllib.parse import quote
 
 import requests
 import streamlit as st
 from fpdf import FPDF
-from PIL import Image
-
-# ==================== CONFIGURATION ====================
-
-used_urls_lock = threading.Lock()
-
-st.set_page_config(page_title="AI Travel Planner", layout="wide")
-
-# Custom CSS for dark theme UI
-st.markdown("""
-<style>
-.stApp {
-    background: linear-gradient(180deg, #07111f 0%, #0f172a 100%);
-    color: #e2e8f0;
-}
-[data-testid="stSidebar"] {
-    background: linear-gradient(180deg, #0b1325 0%, #111827 100%);
-    border-right: 1px solid rgba(148, 163, 184, 0.2);
-}
-.stButton>button, .stDownloadButton>button {
-    background: #2563eb;
-    color: white;
-    border-radius: 10px;
-    border: none;
-    font-weight: 700;
-    width: 100%;
-}
-.main-header { color: #f8fafc; font-weight: 800; font-size: 2.5rem; }
-.hero-card {
-    background: linear-gradient(135deg, rgba(37,99,235,0.26), rgba(14,165,233,0.12));
-    border: 1px solid rgba(148, 163, 184, 0.25);
-    border-radius: 18px;
-    padding: 1.2rem;
-    margin-bottom: 1rem;
-}
-.day-card {
-    background: rgba(15, 23, 42, 0.78);
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    border-radius: 18px;
-    padding: 1rem;
-    margin-bottom: 1rem;
-}
-</style>
-""", unsafe_allow_html=True)
+from PIL import Image, UnidentifiedImageError
 
 
-# ==================== UTILITY FUNCTIONS ====================
+st.set_page_config(page_title="Ai Travel Plan", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    #MainMenu, footer, header, [data-testid="stToolbar"], [data-testid="stDecoration"], .stDeployButton { display: none !important; }
+    .main-header {
+        color: #f8fafc;
+        font-family: Georgia, Cambria, "Times New Roman", serif;
+        font-weight: 700;
+        font-size: 2.85rem;
+        line-height: 1.08;
+        letter-spacing: 0;
+        margin-bottom: 1.5rem;
+        text-shadow: 0 2px 14px rgba(96, 165, 250, 0.18);
+    }
+    .main-header span {
+        color: #93c5fd;
+        font-style: italic;
+    }
+    .stButton>button, .stDownloadButton>button {
+        background: #2563eb;
+        color: white;
+        border-radius: 10px;
+        border: none;
+        font-weight: 700;
+        width: 100%;
+    }
+    .stProgress > div > div > div > div { background-color: #22c55e; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 def safe_text(value: str) -> str:
-    """Normalize text for PDF compatibility."""
     normalized = unicodedata.normalize("NFKD", value or "")
     return normalized.encode("latin-1", "ignore").decode("latin-1").strip()
 
 
-def format_date(day_date: date) -> str:
-    """Format date as 'June 13 - Friday'."""
+def slugify(value: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9]+", "_", value or "")
+    return cleaned.strip("_").lower() or "travel_plan"
+
+
+def format_day_label(day_date: date) -> str:
     return day_date.strftime("%B %d - %A")
 
 
 def compact_date(day_date: date) -> str:
-    """Format date as 'Jun 13, 2024'."""
     return day_date.strftime("%b %d, %Y")
 
 
-def generate_days(start_date: date, end_date: date) -> list[date]:
-    """Generate list of dates from start to end."""
+KNOWN_DESTINATION_PLACES = {
+    "belgium": [
+        ("Brussels, Belgium", ["Grand Place", "Galeries Royales Saint-Hubert", "Manneken Pis", "Royal Palace of Brussels"]),
+        ("Bruges, Belgium", ["Bruges Markt", "Belfry of Bruges", "Rozenhoedkaai", "Basilica of the Holy Blood"]),
+        ("Ghent, Belgium", ["Gravensteen Castle", "Saint Bavo's Cathedral", "Graslei", "Korenlei"]),
+        ("Antwerp, Belgium", ["Antwerp Cathedral", "Grote Markt Antwerp", "MAS Museum", "Antwerp Central Station"]),
+    ],
+    "lahore": [
+        ("Lahore, Pakistan", ["Badshahi Mosque", "Lahore Fort", "Minar-e-Pakistan", "Food Street Lahore"]),
+        ("Old Lahore, Pakistan", ["Walled City of Lahore", "Delhi Gate Lahore", "Shahi Hammam", "Wazir Khan Mosque"]),
+        ("Lahore, Pakistan", ["Shalimar Gardens Lahore", "Lahore Museum", "Anarkali Bazaar", "MM Alam Road Lahore"]),
+        ("Lahore, Pakistan", ["Data Darbar", "Emporium Mall Lahore", "Packages Mall Lahore", "MM Alam Road Lahore"]),
+        ("Lahore, Pakistan", ["Wagah Border", "Greater Iqbal Park", "Lahore Zoo", "Mall Road Lahore"]),
+        ("Lahore, Pakistan", ["Allama Iqbal International Airport", "Lahore Cantonment", "Fortress Stadium Lahore", "Gulberg Lahore"]),
+    ],
+}
+
+
+def normalize_places(value):
+    if isinstance(value, list):
+        return [safe_text(item) for item in value if safe_text(item)]
+    if not value:
+        return []
+    return [safe_text(item) for item in re.split(r",|;|\|", str(value)) if safe_text(item)]
+
+
+DESTINATION_PLACE_CACHE: dict[str, list[str]] = {}
+
+
+WIKIPEDIA_SKIP_TERMS = (
+    "list of", "lists of", "tourism in", "tourist attraction", "tourist attractions",
+    "landmarks in", "history of", "geography of", "economy of", "demographics of",
+    "transport in", "outline of", "culture of", "politics of", "flag of",
+    "coat of arms", "disambiguation", "timeline of", "covid", "syndrome",
+    "visa policy", "foreign relations", "index of", "bibliography of", "museums in",
+    "state park", "station",
+)
+
+
+PLACE_INDICATOR_TERMS = (
+    "aquarium", "arch", "archaeological", "architecture", "attraction", "bazaar",
+    "basilica", "beach", "bridge", "castle", "cathedral", "center", "centre",
+    "church", "city walk", "complex", "district", "fort", "fortress", "gallery",
+    "garden", "gate", "historic", "island", "landmark", "mall", "market",
+    "monument", "mosque", "museum", "old city", "old town", "opera", "palace",
+    "park", "plaza", "quarter", "retail", "shrine", "souk", "square", "street",
+    "temple", "theatre", "tower", "walk", "wheel", "zoo",
+)
+
+
+NON_PLACE_TERMS = (
+    "actor", "album", "anime", "automobile", "car", "character", "doctor", "film",
+    "football", "footballer", "manga", "motorcycle", "novel", "painting", "physician",
+    "politician", "rapper", "record", "singer", "song", "television series",
+    "video game", "writer",
+)
+
+
+def known_destination_contexts(destination: str):
+    key = safe_text(destination).lower()
+    for known_key, options in KNOWN_DESTINATION_PLACES.items():
+        if known_key in key:
+            return options
+    return []
+
+
+def clean_wikipedia_title(title: str):
+    title = safe_text(title).replace("_", " ")
+    title = re.sub(r"\s+\([^)]*\)$", "", title).strip()
+    return title
+
+
+def is_place_like_title(title: str, destination: str):
+    clean_title = clean_wikipedia_title(title)
+    lowered = clean_title.lower()
+    destination_lower = safe_text(destination).lower()
+    if not clean_title or len(clean_title) < 3 or len(clean_title) > 70:
+        return False
+    if ":" in clean_title or lowered == destination_lower:
+        return False
+    return not any(term in lowered for term in WIKIPEDIA_SKIP_TERMS)
+
+
+def has_place_indicator(value: str):
+    lowered = value.lower()
+    extra_title_terms = ("champs", "elysees", "rue", "avenue", "archives", "disneyland")
+    return any(term in lowered for term in PLACE_INDICATOR_TERMS + extra_title_terms)
+
+
+def looks_like_physical_place(title: str, snippet: str, destination: str):
+    title_lower = title.lower()
+    haystack = f"{title} {snippet}".lower()
+    if any(term in haystack for term in NON_PLACE_TERMS):
+        return False
+    if not any(term in haystack for term in PLACE_INDICATOR_TERMS):
+        return False
+    title_mentions_destination = any(word in slugify(title).split("_") for word in destination_words(destination))
+    return has_place_indicator(title) or title_mentions_destination
+
+
+def destination_words(destination: str):
+    words = [word for word in slugify(destination).split("_") if len(word) >= 3]
+    demonyms = {
+        "america": "american",
+        "belgium": "belgian",
+        "china": "chinese",
+        "england": "english",
+        "emirates": "emirati",
+        "france": "french",
+        "germany": "german",
+        "india": "indian",
+        "italy": "italian",
+        "japan": "japanese",
+        "korea": "korean",
+        "pakistan": "pakistani",
+        "spain": "spanish",
+        "turkey": "turkish",
+        "kingdom": "british",
+        "uae": "emirati",
+        "usa": "american",
+    }
+    for word in list(words):
+        if word in demonyms:
+            words.append(demonyms[word])
+    return list(dict.fromkeys(words))
+
+
+def mentions_destination(title: str, snippet: str, destination: str):
+    haystack_text = f"{title} {snippet}".lower()
+    destination_clean = safe_text(destination).lower()
+    if destination_clean and destination_clean in haystack_text:
+        return True
+    haystack = slugify(haystack_text).split("_")
+    haystack_words = set(haystack)
+    words = destination_words(destination)
+    if not words:
+        return True
+    return any(word in haystack_words for word in words)
+
+
+def wikipedia_search_results(query: str, limit: int = 10):
+    try:
+        response = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": query,
+                "srlimit": limit,
+                "srprop": "snippet",
+                "format": "json",
+            },
+            headers={"User-Agent": "AiTravelPlan/1.0"},
+            timeout=15,
+        )
+        response.raise_for_status()
+        results = []
+        for item in response.json().get("query", {}).get("search", []):
+            snippet = re.sub(r"<[^>]+>", "", item.get("snippet", ""))
+            results.append({"title": item.get("title", ""), "snippet": snippet})
+        return results
+    except Exception:
+        return []
+
+
+def discover_destination_places(destination: str):
+    destination_clean = safe_text(destination) or "Destination"
+    cache_key = destination_clean.lower()
+    if cache_key in DESTINATION_PLACE_CACHE:
+        return DESTINATION_PLACE_CACHE[cache_key]
+
+    queries = [
+        f"tourist attractions in {destination_clean}",
+        f"landmarks in {destination_clean}",
+        f"historic sites in {destination_clean}",
+        f"museums in {destination_clean}",
+        f"parks in {destination_clean}",
+        f"architecture in {destination_clean}",
+        f"old city {destination_clean}",
+    ]
+
+    places = []
+    seen = set()
+    for query in queries:
+        for result in wikipedia_search_results(query, limit=12):
+            title = result.get("title", "")
+            snippet = result.get("snippet", "")
+            place = clean_wikipedia_title(title)
+            key = place.lower()
+            if key in seen or not is_place_like_title(place, destination_clean):
+                continue
+            if not mentions_destination(place, snippet, destination_clean):
+                continue
+            if not looks_like_physical_place(place, snippet, destination_clean):
+                continue
+            places.append(place)
+            seen.add(key)
+            if len(places) >= 36:
+                DESTINATION_PLACE_CACHE[cache_key] = places
+                return places
+
+    DESTINATION_PLACE_CACHE[cache_key] = places
+    return places
+
+
+def group_discovered_places(destination: str, total_days: int):
+    destination_clean = safe_text(destination) or "Destination"
+    known_contexts = known_destination_contexts(destination_clean)
+    if known_contexts:
+        return [known_contexts[idx % len(known_contexts)] for idx in range(total_days)]
+
+    discovered = discover_destination_places(destination_clean)
+    if not discovered:
+        discovered = [
+            f"{destination_clean} City Center",
+            f"Historic Landmark in {destination_clean}",
+            f"Main Museum in {destination_clean}",
+            f"Local Market in {destination_clean}",
+            f"Scenic Viewpoint in {destination_clean}",
+            f"Old Town in {destination_clean}",
+        ]
+
+    contexts = []
+    for idx in range(total_days):
+        start = (idx * 4) % len(discovered)
+        places = []
+        offset = 0
+        while len(places) < 4 and offset < len(discovered) + 4:
+            place = discovered[(start + offset) % len(discovered)]
+            if place not in places:
+                places.append(place)
+            offset += 1
+        while len(places) < 4:
+            places.append(f"{destination_clean} Highlight {len(places) + 1}")
+        contexts.append((destination_clean, places))
+    return contexts
+
+
+def fallback_day_title(destination: str, location: str, places: list[str], day_index: int, total_days: int):
+    destination_clean = safe_text(destination) or "Destination"
+    city = safe_text(location).split(",", 1)[0] or destination_clean
+    city_key = city.lower()
+    places_key = " ".join(places).lower()
+
+    if day_index == 0 and "badshahi" in places_key:
+        return "Badshahi Mosque & Lahore Fort"
+    if day_index == 0:
+        return f"Arrival in {city}"
+    if day_index == total_days - 1:
+        return f"Departure from {destination_clean}"
+
+    place_titles = [
+        ("walled city", "Walled City Heritage Walk"),
+        ("shalimar", "Gardens, Museums & Bazaars"),
+        ("emporium", "Modern Lahore Shopping & Shrines"),
+        ("wagah", "Wagah Border & Lahore Parks"),
+        ("airport", f"Departure from {destination_clean}"),
+    ]
+    for key, title in place_titles:
+        if key in places_key:
+            return title
+
+    known_titles = {
+        "brussels": "The Heart of Brussels",
+        "bruges": "Fairytale Day Trip to Bruges",
+        "ghent": "Day Trip to Ghent",
+        "antwerp": "Antwerp Art & Architecture",
+        "old lahore": "Walled City Heritage Walk",
+        "lahore": "Lahore Landmarks & Local Culture",
+    }
+    for key, title in known_titles.items():
+        if key in city_key:
+            return title
+
+    if len(places) >= 2:
+        return f"{places[0]} & {places[1]}"
+    if places:
+        return f"{city}: {places[0]}"
+    return f"{city} Highlights"
+
+
+def fallback_plan(destination: str, start_date: date, end_date: date):
+    total_days = max((end_date - start_date).days + 1, 1)
+    contexts = group_discovered_places(destination, total_days)
     days = []
-    current = start_date
-    while current <= end_date:
-        days.append(current)
-        current += timedelta(days=1)
+    for idx in range(total_days):
+        current_date = start_date + timedelta(days=idx)
+        location, places = contexts[idx]
+        title = fallback_day_title(destination, location, places, idx, total_days)
+
+        days.append(
+            {
+                "date": current_date,
+                "title": title,
+                "location": location,
+                "places": places,
+                "morning": f"Start with {places[0]} and {places[1]} in {location}, focusing on the destination's most recognizable culture, history, and photo stops.",
+                "afternoon": f"Continue toward {places[2]} for local character, museums, food, shopping, or neighborhood exploration connected to {location}.",
+                "evening": f"End near {places[3]} with a scenic walk, dinner, and an easy transfer back to the hotel.",
+            }
+        )
     return days
 
 
-# ==================== IMAGE FETCHING ====================
+def parse_ai_plan(raw_text: str, destination: str, start_date: date, end_date: date):
+    total_days = max((end_date - start_date).days + 1, 1)
+    expected_dates = [start_date + timedelta(days=i) for i in range(total_days)]
+    days = []
+    current = None
 
-def bing_images_scrape(query: str, max_images: int = 5) -> list[str]:
-    """Scrape Bing Images directly. More reliable than Google for scraping."""
-    try:
-        search_url = f"https://www.bing.com/images/search?q={requests.utils.quote(query)}&form=HDRSC2&first=1"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        }
-        
-        response = requests.get(search_url, headers=headers, timeout=15)
-        if response.status_code != 200:
-            return []
-        
-        # Bing stores image data in 'm' attribute of 'iusc' class
-        pattern = r'm="({.*?})"'
-        matches = re.findall(pattern, response.text)
-        
-        image_urls = []
-        for match in matches:
-            try:
-                # Unescape HTML entities
-                clean_json = match.replace('&quot;', '"').replace('&amp;', '&')
-                data = json.loads(clean_json)
-                url = data.get("murl")
-                if url and url.startswith('http') and any(ext in url.lower() for ext in ['.jpg', '.jpeg', '.png', '.webp']):
-                    image_urls.append(url)
-            except:
-                continue
-                
-        return list(dict.fromkeys(image_urls))[:max_images * 2]
-    except Exception:
-        return []
+    for line in [item.strip() for item in raw_text.splitlines() if item.strip()]:
+        lowered = line.lower()
+        if lowered.startswith("day "):
+            if current:
+                days.append(current)
+            current = {"title": "", "location": "", "places": "", "morning": "", "afternoon": "", "evening": ""}
+        elif lowered.startswith("title:"):
+            current = current or {"title": "", "location": "", "places": "", "morning": "", "afternoon": "", "evening": ""}
+            current["title"] = line.split(":", 1)[1].strip()
+        elif lowered.startswith("location:"):
+            current = current or {"title": "", "location": "", "places": "", "morning": "", "afternoon": "", "evening": ""}
+            current["location"] = line.split(":", 1)[1].strip()
+        elif lowered.startswith("places:"):
+            current = current or {"title": "", "location": "", "places": "", "morning": "", "afternoon": "", "evening": ""}
+            current["places"] = line.split(":", 1)[1].strip()
+        elif lowered.startswith("morning:"):
+            current = current or {"title": "", "location": "", "places": "", "morning": "", "afternoon": "", "evening": ""}
+            current["morning"] = line.split(":", 1)[1].strip()
+        elif lowered.startswith("afternoon:"):
+            current = current or {"title": "", "location": "", "places": "", "morning": "", "afternoon": "", "evening": ""}
+            current["afternoon"] = line.split(":", 1)[1].strip()
+        elif lowered.startswith("evening:"):
+            current = current or {"title": "", "location": "", "places": "", "morning": "", "afternoon": "", "evening": ""}
+            current["evening"] = line.split(":", 1)[1].strip()
+        elif current:
+            if current["evening"]:
+                current["evening"] = f"{current['evening']} {line}".strip()
+            elif current["afternoon"]:
+                current["afternoon"] = f"{current['afternoon']} {line}".strip()
+            else:
+                current["morning"] = f"{current['morning']} {line}".strip()
 
+    if current:
+        days.append(current)
 
-def fetch_verified_images(query: str, destination: str, used_urls: set, max_images: int = 4) -> list[str]:
-    """
-    Fetch verified images by scraping Google Images directly.
-    Returns list of local file paths to valid images.
-    """
-    image_paths = []
-    
-    # Try multiple query variations for higher accuracy and realism
-    queries = [
-        f"{query} {destination} landscape photography",
-        f"{query} {destination} landmark view",
-        f"{query} {destination} tourism 4k",
-        f"{query} architectural photography"
-    ]
-    
-    # Negative keywords to avoid drawings, flyers, text-heavy content, and watermarked stock photos
-    negative_keywords = [
-        "drawing", "vector", "flyer", "poster", "text", "infographic", "advertisement", "diagram",
-        "alamy", "stock", "shutterstock", "dreamstime", "123rf", "istockphoto", "watermark", "bus crash"
-    ]
-    for i in range(len(queries)):
-        queries[i] += " " + " ".join([f"-{kw}" for kw in negative_keywords])
-    
-    for q in queries:
-        if len(image_paths) >= max_images:
-            break
-        
-        # Get image URLs from Bing (More reliable)
-        image_urls = bing_images_scrape(q, max_images=5)
-        
-        # Fallback to DuckDuckGo if Bing fails
-        if not image_urls:
-            image_urls = duckduckgo_images(q)
-        
-        for image_url in image_urls:
-            if len(image_paths) >= max_images:
-                break
-            
-            with used_urls_lock:
-                if image_url in used_urls:
-                    continue
-            
-            # Download and verify
-            try:
-                img_resp = requests.get(image_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-                # Increase minimum size to 15KB to filter out simple icons/drawings
-                if img_resp.status_code != 200 or len(img_resp.content) < 15360: 
-                    continue
-                
-                # Verify it's a valid image
-                img = Image.open(BytesIO(img_resp.content))
-                img.verify()
-                
-                # Check minimum dimensions
-                img = Image.open(BytesIO(img_resp.content))
-                width, height = img.size
-                if width < 200 or height < 200:  # Skip tiny images
-                    continue
-                
-                # Convert and save
-                img = img.convert("RGB")
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-                    img.save(f.name, format="JPEG", quality=90)
-                    image_paths.append(f.name)
-                    with used_urls_lock:
-                        used_urls.add(image_url)
-                    
-            except Exception:
-                continue
-    
-    # FINAL FALLBACK: Unsplash (High reliability)
-    if len(image_paths) < max_images:
-        try:
-            # Use direct Unsplash download URL
-            unsplash_url = f"https://images.unsplash.com/photo-1500000000000?auto=format&fit=crop&w=800&q=80&q={requests.utils.quote(query)}"
-            # Actually, better to use the source API or a direct keyword URL
-            keyword_url = f"https://source.unsplash.com/featured/800x600?{requests.utils.quote(query)}"
-            resp = requests.get(keyword_url, timeout=10, allow_redirects=True)
-            if resp.status_code == 200 and len(resp.content) > 2048:
-                img = Image.open(BytesIO(resp.content)).convert("RGB")
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-                    img.save(f.name, format="JPEG")
-                    image_paths.append(f.name)
-        except:
-            pass
+    if not days:
+        return fallback_plan(destination, start_date, end_date)
 
-    return image_paths
+    normalized = []
+    fallback_days = fallback_plan(destination, start_date, end_date)
+    for idx, item in enumerate(days[:total_days]):
+        fallback_item = fallback_days[idx]
+        location = safe_text(item.get("location")) or fallback_item["location"]
+        places = normalize_places(item.get("places")) or fallback_item["places"]
+        normalized.append(
+            {
+                "date": expected_dates[idx],
+                "title": item.get("title") or f"Day {idx + 1} Highlights",
+                "location": location,
+                "places": places,
+                "morning": item.get("morning", "") or fallback_item["morning"],
+                "afternoon": item.get("afternoon", "") or fallback_item["afternoon"],
+                "evening": item.get("evening", "") or fallback_item["evening"],
+            }
+        )
 
+    while len(normalized) < total_days:
+        normalized.append(fallback_days[len(normalized)])
 
-def duckduckgo_images(query: str) -> list[str]:
-    """Fetch images from DuckDuckGo search."""
-    try:
-        # DuckDuckGo image search
-        url = f"https://duckduckgo.com/?q={requests.utils.quote(query)}&iax=images&ia=images"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        
-        # Get the page
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code != 200:
-            return []
-        
-        # Extract image URLs from the response
-        # Look for image URLs in the JSON data embedded in the page
-        urls = []
-        # Pattern to find image URLs
-        pattern = r'https?://[^\s\"<>]+\.(?:jpg|jpeg|png|webp)'
-        matches = re.findall(pattern, resp.text, re.IGNORECASE)
-        
-        for match in matches[:10]:
-            if match.startswith('http') and 'duckduckgo' not in match.lower():
-                urls.append(match)
-        
-        return urls[:5]
-    except Exception:
-        return []
+    return normalized
 
-
-def wikipedia_image(query: str) -> str | None:
-    """Get image from Wikipedia."""
-    try:
-        # Search Wikipedia
-        search_url = f"https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch={requests.utils.quote(query)}&format=json"
-        resp = requests.get(search_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return None
-        
-        data = resp.json()
-        results = data.get("query", {}).get("search", [])
-        if not results:
-            return None
-        
-        # Get first result's page ID
-        page_title = results[0].get("title", "")
-        if not page_title:
-            return None
-        
-        # Get page images
-        image_url = f"https://en.wikipedia.org/w/api.php?action=query&titles={requests.utils.quote(page_title)}&prop=pageimages&format=json&pithumbsize=800"
-        resp = requests.get(image_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code != 200:
-            return None
-        
-        data = resp.json()
-        pages = data.get("query", {}).get("pages", {})
-        for page_id, page_data in pages.items():
-            thumbnail = page_data.get("thumbnail", {})
-            source = thumbnail.get("source", "")
-            if source:
-                return source
-        
-        return None
-    except Exception:
-        return None
-
-
-def download_and_save_image(image_url: str, used_urls: set) -> str | None:
-    """Download image and save to temp file."""
-    with used_urls_lock:
-        if not image_url or image_url in used_urls:
-            return None
-    
-    try:
-        resp = requests.get(image_url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        if resp.status_code == 200 and len(resp.content) >= 1024:
-            img = Image.open(BytesIO(resp.content)).convert("RGB")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-                img.save(f.name, format="JPEG", quality=90)
-                with used_urls_lock:
-                    used_urls.add(image_url)
-                return f.name
-    except Exception:
-        pass
-    
-    return None
-
-
-def get_fallback_image(destination: str, used_urls: set) -> str | None:
-    """Get a high-quality fallback image for the destination using direct scraping."""
-    
-    # Try 1: Direct Google Images scraping
-    queries = [f"{destination} city landmark", f"{destination} tourism", f"{destination} scenic view"]
-    
-    for query in queries:
-        image_urls = bing_images_scrape(query, max_images=5)
-        for image_url in image_urls:
-            path = download_and_save_image(image_url, used_urls)
-            if path:
-                return path
-    
-    # Try 2: DuckDuckGo
-    ddg_queries = [f"{destination} landmark", f"{destination} tourism", f"{destination} city"]
-    for query in ddg_queries:
-        urls = duckduckgo_images(query)
-        for url in urls:
-            path = download_and_save_image(url, used_urls)
-            if path:
-                return path
-    
-    # Try 3: Wikipedia
-    wiki_url = wikipedia_image(destination)
-    if wiki_url:
-        path = download_and_save_image(wiki_url, used_urls)
-        if path:
-            return path
-    
-    # Try 4: Unsplash
-    try:
-        unsplash_url = f"https://source.unsplash.com/800x600/?{requests.utils.quote(destination + ' landmark')}"
-        resp = requests.get(unsplash_url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=True)
-        if resp.status_code == 200 and len(resp.content) >= 1024:
-            img = Image.open(BytesIO(resp.content)).convert("RGB")
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-                img.save(f.name, format="JPEG", quality=90)
-                return f.name
-    except Exception:
-        pass
-    
-    return None
-
-
-def create_placeholder_image(destination: str, place_name: str) -> str:
-    """Create a colored placeholder image with text when no real image is available."""
-    colors = [
-        (59, 130, 246),   # Blue
-        (16, 185, 129),   # Green
-        (245, 158, 11),   # Orange
-        (139, 92, 246),   # Purple
-        (236, 72, 153),   # Pink
-    ]
-    
-    # Use hash of place_name to pick consistent color
-    color_idx = hash(place_name) % len(colors)
-    color = colors[color_idx]
-    
-    # Create image
-    img = Image.new('RGB', (400, 300), color)
-    
-    # Add text overlay
-    try:
-        from PIL import ImageDraw, ImageFont
-        draw = ImageDraw.Draw(img)
-        
-        # Try to use a font, fallback to default
-        try:
-            font = ImageFont.truetype("arial.ttf", 20)
-            small_font = ImageFont.truetype("arial.ttf", 16)
-        except:
-            font = ImageFont.load_default()
-            small_font = ImageFont.load_default()
-        
-        # Draw place name
-        text = safe_text(place_name)[:40]
-        # Get text size for centering
-        bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = bbox[2] - bbox[0]
-        text_height = bbox[3] - bbox[1]
-        x = (400 - text_width) // 2
-        y = (300 - text_height) // 2 - 10
-        
-        # Draw white text with shadow
-        draw.text((x+2, y+2), text, fill=(0, 0, 0), font=font)
-        draw.text((x, y), text, fill=(255, 255, 255), font=font)
-        
-        # Draw destination below
-        dest_text = safe_text(destination)[:30]
-        bbox2 = draw.textbbox((0, 0), dest_text, font=small_font)
-        text_width2 = bbox2[2] - bbox2[0]
-        x2 = (400 - text_width2) // 2
-        y2 = y + 35
-        
-        draw.text((x2+1, y2+1), dest_text, fill=(0, 0, 0), font=small_font)
-        draw.text((x2, y2), dest_text, fill=(255, 255, 255), font=small_font)
-        
-    except Exception:
-        pass
-    
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as f:
-        img.save(f.name, format="JPEG", quality=85)
-        return f.name
-
-
-def build_day_images(day_places: list[str], destination: str, used_urls: set) -> list[dict]:
-    """Build list of images with place names for a day (3-4 images). 100% guarantee."""
-    images_with_names = []
-    
-    # Try to get images for each place
-    for place in day_places[:4]:
-        if len(images_with_names) >= 4:
-            break
-        paths = fetch_verified_images(place, destination, used_urls, max_images=1)
-        if paths:
-            images_with_names.append({"path": paths[0], "name": place})
-        else:
-            # Try fallback for this specific place
-            fallback = get_fallback_image(place, used_urls)
-            if fallback:
-                images_with_names.append({"path": fallback, "name": place})
-    
-    # Fill remaining slots with destination fallback
-    while len(images_with_names) < 4:
-        fallback = get_fallback_image(destination, used_urls)
-        if fallback:
-            images_with_names.append({"path": fallback, "name": destination})
-        else:
-            # Absolute last resort: Placeholder
-            placeholder = create_placeholder_image(destination, destination)
-            images_with_names.append({"path": placeholder, "name": destination})
-    
-    return images_with_names
-
-
-# ==================== ITINERARY GENERATION ====================
-
-def generate_itinerary(customer: str, destination: str, start_date: date, end_date: date) -> dict:
-    """Generate day-by-day itinerary with AI or template."""
-    days = generate_days(start_date, end_date)
-    
-    # Try AI generation first
+def get_ai_plan(client: str, destination: str, start_date: date, end_date: date):
     api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    
-    if api_key:
-        try:
-            itinerary = generate_ai_itinerary(customer, destination, days, api_key)
-            if itinerary:
-                return itinerary
-        except Exception:
-            pass
-    
-    # Fallback to template generation
-    return generate_template_itinerary(customer, destination, days)
+    if not api_key:
+        return fallback_plan(destination, start_date, end_date)
 
+    prompt = f"""
+Create a professional travel plan.
 
-def generate_ai_itinerary(customer: str, destination: str, days: list[date], api_key: str) -> dict | None:
-    """Generate itinerary using AI API."""
-    prompt = f"""Create a detailed travel itinerary for {customer} visiting {destination}.
+Client: {client}
+Destination: {destination}
+Dates: {start_date} to {end_date}
 
-Create a JSON response with this exact structure:
-{{
-  "customer": "{customer}",
-  "destination": "{destination}",
-  "days": [
-    {{
-      "date": "YYYY-MM-DD",
-      "title": "Day Title",
-      "morning": "Morning activities...",
-      "afternoon": "Afternoon activities...",
-      "evening": "Evening activities...",
-      "places": ["Place 1", "Place 2", "Place 3", "Place 4"]
-    }}
-  ]
-}}
+Return plain text only using this exact format:
 
-Requirements:
-- {len(days)} days total from {days[0]} to {days[-1]}
-- Each day must have 4 specific places
-- Morning, Afternoon, Evening sections
-- First day is "Arrival & First Impressions"
-- Last day is "Departure Day"
-- Real, specific landmarks and attractions only
+Day 1
+Title: ...
+Location: specific city/neighborhood, country
+Places: exact place 1, exact place 2, exact place 3, exact place 4
+Morning: mention the exact place names for the morning plan.
+Afternoon: mention the exact place names for the afternoon plan.
+Evening: mention the exact place names for the evening plan.
 
-Return ONLY valid JSON."""
+Day 2
+Title: ...
+Location: specific city/neighborhood, country
+Places: exact place 1, exact place 2, exact place 3, exact place 4
+Morning: mention the exact place names for the morning plan.
+Afternoon: mention the exact place names for the afternoon plan.
+Evening: mention the exact place names for the evening plan.
+
+Use real, photo-friendly locations and landmarks. Keep each day practical and realistic.
+"""
 
     try:
         response = requests.post(
             "https://openrouter.ai/api/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
+            headers={"Authorization": f"Bearer {api_key}"},
             json={
-                "model": "openai/gpt-4o-mini",
+                "model": "anthropic/claude-3-haiku",
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.7,
             },
             timeout=60,
         )
-        
-        if response.status_code != 200:
-            return None
-            
+        response.raise_for_status()
         data = response.json()
-        content = data["choices"][0]["message"]["content"]
-        
-        # Extract JSON
-        start = content.find("{")
-        end = content.rfind("}")
-        if start == -1 or end == -1:
+        raw_text = data["choices"][0]["message"]["content"]
+        return parse_ai_plan(raw_text, destination, start_date, end_date)
+    except Exception:
+        return fallback_plan(destination, start_date, end_date)
+
+
+def image_fingerprint(image_bytes: bytes) -> str | None:
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            image = image.convert("L").resize((8, 8))
+            pixels = list(image.getdata())
+            average = sum(pixels) / len(pixels)
+            return "".join("1" if pixel >= average else "0" for pixel in pixels)
+    except (UnidentifiedImageError, OSError):
+        return None
+
+
+def download_image(url: str, used_hashes: set[str] | None = None):
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                url,
+                headers={"User-Agent": "AiTravelPlan/1.0"},
+                timeout=25,
+            )
+            if response.status_code == 429 and attempt == 0:
+                time.sleep(1.2)
+                continue
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "").lower()
+            if "image" not in content_type:
+                return None
+
+            image_bytes = response.content
+            image_hash = hashlib.md5(image_bytes).hexdigest()
+            if used_hashes is not None and image_hash in used_hashes:
+                return None
+
+            if used_hashes is not None:
+                used_hashes.add(image_hash)
+
+            suffix = ".png" if "png" in content_type else ".jpg"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+                temp_file.write(image_bytes)
+                return temp_file.name
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.4)
+                continue
             return None
-            
-        itinerary = json.loads(content[start:end+1])
-        
-        # Global place deduplication
-        seen_places = set()
-        
-        # Ensure all dates are formatted correctly and places are unique
-        for i, day_data in enumerate(itinerary.get("days", [])):
-            if i < len(days):
-                day_data["date"] = days[i].strftime("%Y-%m-%d")
-                day_data["date_display"] = format_date(days[i])
-                
-                # Filter out duplicate places
-                unique_day_places = []
-                for p in day_data.get("places", []):
-                    if p.lower() not in seen_places:
-                        unique_day_places.append(p)
-                        seen_places.add(p.lower())
-                
-                # If we have less than 4, add more specific landmarks if possible
-                day_data["places"] = unique_day_places[:4]
-                
-        return itinerary
-        
+    return None
+
+
+def get_cover_image(destination: str, used_hashes: set[str] | None = None):
+    seed = slugify(destination)
+    for url in [
+        f"https://loremflickr.com/1200/700/{seed},city?lock={image_lock(seed + '_cover')}",
+        f"https://picsum.photos/seed/{seed}_cover/1200/700",
+    ]:
+        path = download_image(url, used_hashes)
+        if path:
+            return path
+    return None
+
+
+def image_lock(value: str) -> int:
+    digest = hashlib.md5(value.encode("utf-8")).hexdigest()
+    return int(digest[:8], 16) % 100000
+
+
+CURATED_PLACE_IMAGE_FILES = {
+    "badshahi mosque": ["Badshahi Mosque, Lahore I.jpg", "Badshahi Mosque (Lahore).jpg"],
+    "lahore fort": ["Lahore Fort view from Baradari.jpg", "Alamgiri Gate, Lahore Fort.jpg"],
+    "minar e pakistan": ["Minar-e-Pakistan(Lahore).jpg", "Minar-e-Pakistan Lahore,Pakistan.jpg"],
+    "food street lahore": ["Food Street, Lahore - panoramio.jpg", "Food street lahore by kamran.jpg"],
+    "walled city of lahore": ["Old Lahore.jpg", "Walled city lahore and its colors.jpg"],
+    "delhi gate lahore": ["Delhi Gate, Lahore.jpg", "Delhi Gate - Lahore - Pakistan.jpg"],
+    "shahi hammam": ["Outside Shahi Hammam (Wazir Khan's hammam).jpg", "Shahi Hammam Arches.jpg"],
+    "wazir khan mosque": ["Courtyard of Wazir Khan Mosque, Lahore.jpg", "Masjid Wazir Khan of Lahore.jpg"],
+    "shalimar gardens lahore": ["Shalimar Gardens (Lahore).jpg", "Shalimar Gardens (Lahore) 1.jpg"],
+    "lahore museum": ["Lahore Museum, Lahore.jpg", "Front View of Lahore Museum.jpg"],
+    "anarkali bazaar": ["Inside view of anarkali bazar.jpg", "Street view anarkali lahore.jpg"],
+    "liberty market lahore": ["MM Alam Road 1.jpg", "MM Alam Road 2.jpg"],
+    "data darbar": ["Data Darbar 2.jpg", "Data Darbar Shrine @ Lahore (15285413030).jpg"],
+    "emporium mall lahore": ["Emporium Mall.jpg", "Emporium Mall 2.jpg", "The Boulevard, Emporium Mall, Lahore.jpg"],
+    "packages mall lahore": ["Packages Mall, Lahore 10.jpg", "Packages Mall, Lahore 11.jpg"],
+    "mm alam road lahore": ["MM Alam Road 1.jpg", "MM Alam Road 2.jpg", "Freddy's Cafe on M.M Alam road Lahore.jpg"],
+    "wagah border": ["Wagah Border 2023.jpg", "Wagah border ceremony2.jpg"],
+    "lahore zoo": ["Lahore Zoo Entrance.jpg"],
+}
+
+
+def canonical_place_key(place: str):
+    key = slugify(place).replace("_", " ")
+    key = key.replace("minar e pakistan", "minar e pakistan")
+    return key.strip()
+
+
+def curated_place_urls(place: str):
+    files = CURATED_PLACE_IMAGE_FILES.get(canonical_place_key(place), [])
+    return [
+        f"https://commons.wikimedia.org/wiki/Special:FilePath/{quote(file_name)}?width=900"
+        for file_name in files
+    ]
+
+
+IMAGE_KEYWORD_STOP_WORDS = {
+    "a", "an", "and", "at", "by", "for", "from", "in", "of", "on", "the", "to",
+    "pakistan", "lahore", "belgium", "brussels", "photo", "image", "view",
+}
+
+
+def image_keywords(value: str):
+    words = [word for word in slugify(value).split("_") if word]
+    keywords = [word for word in words if word not in IMAGE_KEYWORD_STOP_WORDS and len(word) >= 2]
+    return keywords or [word for word in words if word not in {"a", "an", "and", "of", "the"}]
+
+
+def title_matches_place(title: str, place: str):
+    title_words = set(slugify(title).split("_"))
+    keywords = image_keywords(place)
+    if not keywords:
+        return True
+    matches = sum(1 for keyword in keywords if keyword in title_words)
+    required = 1 if len(keywords) <= 2 else 2
+    return matches >= required
+
+
+def get_wikimedia_place_image_urls(place: str, destination: str):
+    search_terms = [f"{place} {destination}", place]
+    urls = []
+    seen_urls = set()
+
+    for url in curated_place_urls(place):
+        urls.append(url)
+        seen_urls.add(url)
+
+    for term in search_terms:
+        try:
+            response = requests.get(
+                "https://commons.wikimedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "generator": "search",
+                    "gsrsearch": term,
+                    "gsrnamespace": 6,
+                    "gsrlimit": 14,
+                    "prop": "imageinfo",
+                    "iiprop": "url|mime",
+                    "iiurlwidth": 900,
+                    "format": "json",
+                },
+                headers={"User-Agent": "AiTravelPlan/1.0"},
+                timeout=18,
+            )
+            response.raise_for_status()
+            pages = list(response.json().get("query", {}).get("pages", {}).values())
+            for page in pages:
+                title = page.get("title", "")
+                info = (page.get("imageinfo") or [{}])[0]
+                mime = info.get("mime", "")
+                url = info.get("thumburl") or info.get("url")
+                if not mime.startswith("image/") or not url or url in seen_urls:
+                    continue
+                if title_matches_place(title, place):
+                    urls.append(url)
+                    seen_urls.add(url)
+        except Exception:
+            continue
+
+    return urls
+
+
+def create_place_card(place: str, location: str):
+    try:
+        image = Image.new("RGB", (900, 600), "#e8eef5")
+        # Keep this fallback honest: a labeled card is better than a wrong beach/Eiffel photo.
+        from PIL import ImageDraw
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 0, 900, 600), fill="#e8eef5")
+        draw.rectangle((0, 0, 900, 115), fill="#1f4e79")
+        draw.text((38, 36), safe_text(place)[:55], fill="white")
+        draw.text((38, 150), safe_text(location)[:70], fill="#1f2937")
+        draw.text((38, 215), "Photo not available from Wikimedia Commons", fill="#475569")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
+            image.save(temp_file.name, format="JPEG", quality=92)
+            return temp_file.name
     except Exception:
         return None
 
 
-def generate_template_itinerary(customer: str, destination: str, days: list[date]) -> dict:
-    """Generate template-based itinerary when AI fails."""
-    itinerary_days = []
-    
-    dest_lower = destination.lower()
-    
-    # Pakistan City-Specific Landmark Database
-    pakistan_cities = {
-        "lahore": [
-            "Badshahi Mosque Lahore", "Lahore Fort", "Minar-e-Pakistan", "Shalamar Gardens Lahore",
-            "Wazir Khan Mosque Lahore", "Anarkali Bazaar", "Wagah Border Ceremony", "Delhi Gate Lahore",
-            "Lahore Museum", "Jallo Park", "Greater Iqbal Park", "Liberty Market Lahore",
-            "Data Darbar", "Chauburji Lahore", "Shahi Hammam", "Lawrence Gardens",
-            "Tomb of Jahangir", "Gulshan-e-Iqbal Park", "Model Town Park", "Lahore Zoo",
-            "Food Street Fort Road", "Packages Mall Lahore", "Emporium Mall", "Race Course Park"
-        ],
-        "karachi": [
-            "Mohatta Palace Karachi", "Mazar-e-Quaid Karachi", "Clifton Beach Karachi", "Pakistan Maritime Museum",
-            "Frere Hall Karachi", "PAF Museum Karachi", "Dolmen Mall Clifton", "Port Grand Karachi",
-            "Chaukhandi Tombs", "Turtle Beach Karachi", "Empress Market", "DHA Golf Club Karachi",
-            "National Museum of Pakistan", "Hill Park Karachi", "Bin Qasim Park", "St. Patrick's Cathedral",
-            "Do Darya Karachi", "Dreamworld Resort", "Lucky One Mall", "Manora Island"
-        ],
-        "islamabad": [
-            "Faisal Mosque Islamabad", "Daman-e-Koh Islamabad", "Lok Virsa Museum", "Pakistan Monument",
-            "Rawal Lake Islamabad", "Centaurus Mall", "Margalla Hills National Park", "Saidpur Village",
-            "Shakarparian Park", "Rose and Jasmine Garden", "National Art Gallery Islamabad", "The Monal",
-            "Lake View Park", "Fatima Jinnah Park", "Safari Park Islamabad", "Giga Mall",
-            "Shah Allah Ditta Caves", "Golra Sharif Railway Museum", "Islamabad Club", "Japanese Park",
-            "Safa Gold Mall", "F-6 Markaz", "F-7 Flower Market", "National Museum of Natural History",
-            "Blue Area Islamabad", "Supreme Court Building", "Parliament House Islamabad", "Rawal Dam",
-            "Simly Dam", "King Faisal Mosque Exterior", "Margalla Road Drive", "Islamabad Zoo Ruins"
-        ],
-        "bahawalpur": [
-            "Noor Mahal Bahawalpur", "Derawar Fort", "Uch Sharif", "Abbasi Mosque",
-            "Gulzar Mahal", "Sadiq Garh Palace", "Lal Suhanra National Park", "Bahawalpur Zoo",
-            "Central Library Bahawalpur", "Darbar Mahal", "Jamia Masjid Al-Sadiq", "Farid Gate"
-        ],
-        "murree": [
-            "Mall Road Murree", "Pindi Point", "Kashmir Point", "Patriata Chair Lift",
-            "Ayubia National Park", "Nathia Gali", "Thandiani", "Mushkpuri Peak",
-            "Dunga Gali", "Pipe Line Track", "Changla Gali", "Ghora Gali"
-        ],
-        "swat": [
-            "Mingora Bazaar", "Malam Jabba", "Fizagat Park", "Marghuzar White Palace",
-            "Kalam Valley", "Mahodand Lake", "Ushu Forest", "Gabina Jabba",
-            "Madyan Swat", "Behrain Swat", "Kundol Lake", "Spin Khwar Lake"
-        ]
-    }
-    
-    # Check if a specific city is mentioned in the destination
-    matched_city = None
-    for city in pakistan_cities:
-        if city in dest_lower:
-            matched_city = city
-            break
-            
-    # Extract all relevant landmarks into a single pool
-    landmark_pool = []
-    if matched_city:
-        landmark_pool = pakistan_cities[matched_city].copy()
-    elif "pakistan" in dest_lower:
-        # Flatten all Pakistan city groups into one pool
-        for group in [
-            ["Faisal Mosque Islamabad", "Daman-e-Koh Islamabad", "Lok Virsa Museum", "Pakistan Monument"],
-            ["Badshahi Mosque Lahore", "Lahore Fort", "Minar-e-Pakistan", "Shalamar Gardens Lahore"],
-            ["Wazir Khan Mosque Lahore", "Anarkali Bazaar", "Wagah Border Ceremony", "Delhi Gate Lahore"],
-            ["Noor Mahal Bahawalpur", "Derawar Fort", "Uch Sharif", "Abbasi Mosque"],
-            ["Mohatta Palace Karachi", "Mazar-e-Quaid Karachi", "Clifton Beach Karachi", "Pakistan Maritime Museum"],
-            ["Lake Saif-ul-Malook", "Babusar Pass", "Lulusar Lake", "Kiwai Waterfalls"],
-            ["Hunza Valley", "Baltit Fort", "Attabad Lake", "Passu Cones"]
-        ]:
-            landmark_pool.extend(group)
-    else:
-        landmark_pool = [
-            f"Main landmark of {destination}",
-            f"Historic center of {destination}",
-            f"Famous museum in {destination}",
-            f"Popular market in {destination}",
-            f"Scenic viewpoint in {destination}",
-            f"Cultural district of {destination}",
-            f"Old town area of {destination}",
-            f"Riverside/waterfront of {destination}",
-            f"Local park in {destination}",
-            f"Shopping mall in {destination}",
-            f"Botanical garden of {destination}",
-            f"Art gallery in {destination}"
-        ]
+def get_day_images(destination: str, title: str, location: str, places: list[str], day_index: int, used_hashes: set[str]):
+    paths = []
+    normalized_places = normalize_places(places)
+    place_urls = [(place, get_wikimedia_place_image_urls(place, destination)) for place in normalized_places[:4]]
 
-    for i, day in enumerate(days):
-        # Pick 4 unique landmarks from the pool
-        day_places = []
-        for j in range(4):
-            if landmark_pool:
-                day_places.append(landmark_pool.pop(0))
-            else:
-                # Varied fallback names to ensure unique search results without using unprofessional numbering
-                fallback_names = [
-                    "Historic District", "Central Square", "Riverside View", "Heritage Site",
-                    "Cultural Plaza", "Main Boulevard", "Green Park", "Art District",
-                    "Old Town Area", "Scenic Lookout", "Clock Tower Square", "Garden Walk",
-                    "Modern Skyview", "Waterfront Area", "Memorial Park", "Market Street",
-                    "Government Building", "University Grounds", "Botanical Corner", "Craft Center"
-                ]
-                name_idx = (i * 4 + j) % len(fallback_names)
-                day_places.append(f"{fallback_names[name_idx]} in {city_name}")
-        # Determine the city name for descriptions
-        if matched_city:
-            city_name = matched_city.title()
-        elif "pakistan" in dest_lower:
-            # For country-wide, try to infer city from the first landmark of the day
-            parts = day_places[0].split()
-            city_name = parts[-1] if len(parts) > 0 else destination
-        else:
-            city_name = destination
-        
-        if i == 0:
-            title = f"Arrival & First Impressions of {city_name}"
-            morning = f"Arrive in {city_name}. Visit {day_places[0]} to start your journey."
-            afternoon = f"Explore the vibrant atmosphere of {day_places[1]}."
-            evening = f"Enjoy a welcome dinner near {day_places[2]}."
-        elif i == len(days) - 1:
-            title = f"Departure from {city_name}"
-            morning = f"Final morning visit to {day_places[0]} for souvenirs."
-            afternoon = f"Last-minute photography at {day_places[1]}."
-            evening = f"Transfer to the airport after a brief stop at {day_places[2]}."
-        else:
-            title = f"Exploring {city_name}"
-            morning = f"Start your day with a visit to the historic {day_places[0]}."
-            afternoon = f"Continue your exploration at {day_places[1]} and local surroundings."
-            evening = f"Evening stroll through {day_places[2]} followed by dinner at a popular spot."
-        
-        itinerary_days.append({
-            "date": day.strftime("%Y-%m-%d"),
-            "date_display": format_date(day),
-            "title": title,
-            "morning": morning,
-            "afternoon": afternoon,
-            "evening": evening,
-            "places": day_places,
-        })
-    
-    return {
-        "customer": customer,
-        "destination": destination,
-        "days": itinerary_days,
-    }
+    for _, urls in place_urls:
+        for url in urls:
+            place_path = download_image(url, used_hashes)
+            if place_path:
+                paths.append(place_path)
+                break
+        if len(paths) >= 3:
+            return paths[:3]
+
+    for _, urls in place_urls:
+        for url in urls:
+            place_path = download_image(url, used_hashes)
+            if place_path:
+                paths.append(place_path)
+            if len(paths) >= 3:
+                return paths[:3]
+
+    for fallback_place in [location, destination]:
+        for url in get_wikimedia_place_image_urls(fallback_place, destination):
+            place_path = download_image(url, used_hashes)
+            if place_path:
+                paths.append(place_path)
+            if len(paths) >= 3:
+                return paths[:3]
+
+    return paths[:3]
 
 
-# ==================== PDF GENERATION ====================
-
-class TravelPDF(FPDF):
-    """Custom PDF class with page numbering."""
-    
-    def __init__(self, customer: str):
-        super().__init__()
-        self.customer = customer
-        self.total_pages = 0
-        
+class TravelPlanPDF(FPDF):
     def header(self):
-        """No header on every page for this layout."""
-        pass
-        
-    def footer(self):
-        """Add page numbering at the bottom right."""
-        self.set_y(-15)
-        self.set_font("Helvetica", "I", 8)
-        self.set_text_color(150, 150, 150)
-        self.cell(0, 10, f"Page {self.page_no()}", align="R")
-
-    def draw_timeline(self, y_start, y_end):
-        """Draw a vertical line on the left with a calendar icon."""
-        self.set_draw_color(220, 220, 220)
-        self.set_line_width(0.4)
-        self.line(25, y_start, 25, y_end)
-        
-        # Draw a circle for the icon
-        self.set_draw_color(100, 116, 139) # Slate color
-        self.set_line_width(0.6)
-        self.set_fill_color(255, 255, 255)
-        self.circle(25, y_start + 1, 6, style="FD")
-        
-        # Calendar icon representation
-        self.set_draw_color(100, 116, 139)
-        self.rect(22.5, y_start - 0.5, 5, 4, style="D")
-        self.line(22.5, y_start + 0.5, 27.5, y_start + 0.5)
+        if self.page_no() >= 3:
+            self.set_font("Helvetica", "B", 8)
+            self.set_text_color(0, 0, 0)
+            self.cell(0, 6, f"Page {self.page_no()} of {{nb}}", align="R")
+            self.ln(3)
 
 
-def create_pdf(itinerary: dict, day_images: dict) -> bytes:
-    """Create professional PDF with grid layout."""
-    customer = itinerary.get("customer", "Customer")
-    destination = itinerary.get("destination", "Destination")
-    days = itinerary.get("days", [])
-    
-    pdf = TravelPDF(customer)
-    pdf.set_auto_page_break(auto=True, margin=20)
-    
-    # --- Page 1: COVER PAGE ---
+def draw_cover_page(pdf: TravelPlanPDF, client: str, title: str, start_date: date, end_date: date, cover_path: str | None):
     pdf.add_page()
-    pdf.ln(20)
+    pdf.set_fill_color(255, 255, 255)
+    pdf.rect(0, 0, 210, 297, "F")
+
+    pdf.set_xy(0, 18)
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(210, 10, safe_text(client.upper()), align="C")
+
+    if cover_path:
+        pdf.image(cover_path, x=10, y=38, w=190, h=86)
+
+    pdf.set_xy(0, 132)
     pdf.set_font("Helvetica", "B", 16)
-    pdf.set_text_color(50, 50, 50)
-    pdf.cell(0, 10, safe_text(customer.upper()), ln=True, align="C")
-    pdf.ln(10)
-    
-    cover_image = None
-    if day_images.get(0):
-        cover_image = day_images[0][0]["path"]
-    
-    if cover_image:
+    pdf.set_text_color(14, 44, 85)
+    pdf.cell(210, 10, safe_text(title), align="C")
+
+    pdf.set_xy(0, 146)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(53, 90, 129)
+    pdf.cell(210, 8, safe_text(f"{compact_date(start_date)} - {compact_date(end_date)}"), align="C")
+
+
+def draw_summary_page(pdf: TravelPlanPDF, days: list[dict]):
+    pdf.add_page()
+    pdf.set_xy(14, 18)
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.set_text_color(58, 83, 101)
+    pdf.cell(0, 10, "Trip Summary")
+
+    pdf.set_draw_color(210, 220, 230)
+    pdf.line(14, 34, 196, 34)
+    pdf.set_y(46)
+
+    for item in days:
+        if pdf.get_y() > 260:
+            pdf.add_page()
+            pdf.set_y(18)
+
+        y = pdf.get_y()
+        location = safe_text(item.get("location", ""))
+        places = normalize_places(item.get("places", []))[:3]
+        detail_parts = []
+        if location:
+            detail_parts.append(location)
+        if places:
+            detail_parts.append(", ".join(places))
+        detail = " - ".join(detail_parts)
+        if len(detail) > 120:
+            detail = f"{detail[:117]}..."
+
+        pdf.set_draw_color(210, 220, 230)
+        pdf.line(14, y + 3, 34, y + 3)
+
+        pdf.set_xy(40, y)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(58, 83, 101)
+        pdf.cell(0, 6, safe_text(format_day_label(item["date"])))
+
+        pdf.set_xy(40, y + 7)
+        pdf.set_font("Helvetica", "", 10.5)
+        pdf.set_text_color(0, 0, 0)
+        pdf.cell(0, 5, safe_text(item["title"]))
+
+        if detail:
+            pdf.set_xy(40, y + 13)
+            pdf.set_font("Helvetica", "", 8.5)
+            pdf.set_text_color(82, 92, 105)
+            pdf.multi_cell(145, 4, safe_text(detail))
+
+        pdf.set_y(y + 23)
+
+
+def draw_calendar_marker(pdf: TravelPlanPDF, x: float, y: float):
+    pdf.set_draw_color(45, 62, 78)
+    pdf.set_fill_color(255, 255, 255)
+    pdf.ellipse(x - 4.5, y - 1, 9, 9, "DF")
+
+    icon_x = x - 2.4
+    icon_y = y + 1.2
+    pdf.set_draw_color(45, 62, 78)
+    pdf.rect(icon_x, icon_y, 4.8, 4.2)
+    pdf.line(icon_x, icon_y + 1.3, icon_x + 4.8, icon_y + 1.3)
+    pdf.set_line_width(0.35)
+    pdf.line(icon_x + 1.2, icon_y - 0.5, icon_x + 1.2, icon_y + 0.8)
+    pdf.line(icon_x + 3.6, icon_y - 0.5, icon_x + 3.6, icon_y + 0.8)
+    pdf.set_line_width(0.2)
+
+
+def draw_image_grid(pdf: TravelPlanPDF, image_paths: list[str], x: float, y: float):
+    if not image_paths:
+        return y
+
+    positions = [
+        (x, y, 78, 52),
+        (x + 80, y, 39, 25),
+        (x + 80, y + 27, 39, 25),
+    ]
+
+    for idx, image_path in enumerate(image_paths[:3]):
+        px, py, pw, ph = positions[idx]
         try:
-            pdf.image(cover_image, x=20, y=50, w=170, h=100)
-        except: pass
-    
-    pdf.set_y(160)
-    pdf.set_font("Helvetica", "B", 24)
-    pdf.set_text_color(0, 102, 204)
-    pdf.cell(0, 15, "Travel Plan", ln=True, align="C")
-    
-    pdf.set_font("Helvetica", "", 12)
-    pdf.set_text_color(100, 100, 100)
-    date_range = f"{compact_date(datetime.strptime(days[0]['date'], '%Y-%m-%d').date())} - {compact_date(datetime.strptime(days[-1]['date'], '%Y-%m-%d').date())}"
-    pdf.cell(0, 10, safe_text(date_range), ln=True, align="C")
-    
-    # --- Page 2: TRIP SUMMARY ---
-    pdf.add_page()
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.set_text_color(50, 50, 50)
-    pdf.cell(0, 15, "Trip Summary", ln=True)
-    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
-    pdf.ln(10)
-    
-    y_summary_start = pdf.get_y()
-    for i, day in enumerate(days):
-        pdf.set_x(30)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.set_text_color(50, 50, 50)
-        pdf.cell(40, 8, safe_text(day.get("date_display", "")))
-        pdf.set_font("Helvetica", "", 10)
-        pdf.cell(0, 8, safe_text(day.get("title", "")), ln=True)
-        pdf.ln(2)
-        
-    y_summary_end = pdf.get_y()
-    pdf.set_draw_color(220, 220, 220)
-    pdf.line(25, y_summary_start, 25, y_summary_end)
-    
-    # --- DAY PAGES ---
-    for i, day in enumerate(days):
+            pdf.image(image_path, x=px, y=py, w=pw, h=ph)
+        except Exception:
+            continue
+
+    return y + 56
+
+
+def draw_bullet_line(pdf: TravelPlanPDF, label: str, content: str, x: float):
+    clean_content = safe_text(content)
+    if not clean_content:
+        return
+
+    bullet_x = x
+    text_x = x + 4
+    y = pdf.get_y()
+    right_edge = 194
+
+    pdf.set_xy(bullet_x, y + 1.5)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(3, 3, chr(149))
+
+    pdf.set_xy(text_x, y)
+    pdf.set_font("Helvetica", "B", 8.5)
+    pdf.write(4.5, f"{label}: ")
+    content_x = pdf.get_x()
+    content_width = max(80, right_edge - content_x)
+    pdf.set_font("Helvetica", "", 8.5)
+    pdf.multi_cell(content_width, 4.5, clean_content)
+
+
+def draw_day_block(pdf: TravelPlanPDF, item: dict, image_paths: list[str]):
+    if pdf.get_y() > 222:
         pdf.add_page()
-        y_day_start = pdf.get_y()
-        
-        pdf.set_font("Helvetica", "B", 18)
-        pdf.set_text_color(50, 50, 50)
-        pdf.set_x(15)
-        pdf.cell(0, 15, safe_text(day.get("date_display", f"Day {i+1}")))
-        pdf.set_draw_color(220, 230, 240)
-        pdf.line(15, pdf.get_y() + 12, 195, pdf.get_y() + 12)
-        pdf.ln(20)
-        
-        # Activity Sections
-        pdf.set_font("Helvetica", "", 11)
-        pdf.set_text_color(60, 60, 60)
-        
-        sections = [
-            ("Morning", day.get("morning", "")),
-            ("Afternoon", day.get("afternoon", "")),
-            ("Evening", day.get("evening", ""))
-        ]
-        
-        def write_activity_text(label, text, places):
-            pdf.set_font("Helvetica", "B", 11)
-            pdf.set_text_color(51, 65, 85)
-            pdf.set_draw_color(30, 64, 175)
-            pdf.set_fill_color(30, 64, 175)
-            pdf.circle(32, pdf.get_y() + 2.5, 0.8, style="FD")
-            
-            pdf.set_x(35)
-            pdf.write(6, f" {label}: ")
-            
-            pdf.set_font("Helvetica", "", 11)
-            pdf.set_text_color(71, 85, 105)
-            
-            words = text.split()
-            for word in words:
-                clean_word = re.sub(r'[^a-zA-Z]', '', word)
-                is_landmark = any(p.lower().startswith(clean_word.lower()) for p in places if len(clean_word) > 3)
-                
-                if is_landmark:
-                    pdf.set_text_color(37, 99, 235)
-                    pdf.write(6, word + " ")
-                    pdf.set_text_color(71, 85, 105)
-                else:
-                    pdf.write(6, word + " ")
-            pdf.ln(8)
 
-        for label, text in sections:
-            write_activity_text(label, text, day.get("places", []))
-            
-        pdf.ln(5)
-        
-        # Image Grid (4-image Mosaic)
-        images = day_images.get(i, [])
-        if images and len(images) >= 4:
-            content_x = 35
-            y_img_start = pdf.get_y()
-            grid_w = 160
-            img_large_w = 100
-            img_large_h = 70
-            gap = 2
-            img_sm_w = (grid_w - img_large_w - 2 * gap) / 2
-            img_sm_h = (img_large_h - gap) / 2
-            
-            try:
-                pdf.image(images[0]["path"], x=content_x, y=y_img_start, w=img_large_w, h=img_large_h)
-                pdf.image(images[1]["path"], x=content_x + img_large_w + gap, y=y_img_start, w=img_sm_w, h=img_sm_h)
-                pdf.image(images[2]["path"], x=content_x + img_large_w + gap, y=y_img_start + img_sm_h + gap, w=img_sm_w, h=img_sm_h)
-                pdf.image(images[3]["path"], x=content_x + img_large_w + img_sm_w + 2 * gap, y=y_img_start, w=img_sm_w, h=img_large_h)
-            except: pass
-            
-            pdf.set_y(y_img_start + img_large_h + 10)
-        
-        y_day_end = pdf.get_y()
-        pdf.draw_timeline(y_day_start + 18, y_day_end)
-    
-    # Update total pages and regenerate for correct footer
-    output = pdf.output()
-    return bytes(output) if isinstance(output, bytearray) else output.encode("latin-1", errors="ignore") if isinstance(output, str) else output
+    left_margin = 24
+    marker_x = 28
+    content_x = 43
 
+    pdf.set_draw_color(196, 208, 220)
+    pdf.line(left_margin, pdf.get_y(), 196, pdf.get_y())
+    pdf.ln(4)
 
-# ==================== MAIN APP ====================
+    pdf.set_x(left_margin)
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.set_text_color(52, 86, 129)
+    pdf.cell(0, 7, safe_text(format_day_label(item["date"])))
+    pdf.ln(8)
 
-def main():
-    """Main Streamlit application."""
-    
-    st.markdown('<p class="main-header">AI Travel Planner</p>', unsafe_allow_html=True)
-    st.markdown("<p style='color:#cbd5e1;'>Generate professional travel itineraries with verified images</p>", unsafe_allow_html=True)
-    
-    # Sidebar form
-    with st.sidebar:
-        st.header("Trip Details")
-        
-        customer_name = st.text_input("Customer Name", placeholder="e.g., Mr. Rana Muhammad Asif")
-        destination = st.text_input("Destination", placeholder="e.g., Cape Town")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("Start Date", date.today())
-        with col2:
-            end_date = st.date_input("End Date", date.today() + timedelta(days=7))
-        
-        generate_btn = st.button("Generate Itinerary", type="primary")
-        
-        st.divider()
-        st.caption("Images fetched from Bing Search with verification")
-        
-        if not os.getenv("OPENROUTER_API_KEY"):
-            st.warning("⚠️ API Key missing. Using basic templates instead of AI.")
-    
-    # Main content
-    if generate_btn:
-        if not customer_name or not destination:
-            st.error("Please fill in all required fields.")
-            return
-            
-        if end_date < start_date:
-            st.error("End date must be after start date.")
-            return
-        
-        progress = st.progress(0, text="Generating itinerary...")
-        
-        try:
-            # Step 1: Generate itinerary
-            progress.progress(20, text="Creating day-by-day plan...")
-            itinerary = generate_itinerary(customer_name, destination, start_date, end_date)
-            
-            # Step 2: Fetch images for each day (Parallelized)
-            progress.progress(50, text="Fetching verified images (Parallel)...")
-            used_urls = set()
-            day_images = {}
-            
-            days = itinerary.get("days", [])
-            
-            def fetch_day_images(idx, day_data):
-                return idx, build_day_images(day_data.get("places", []), destination, used_urls)
+    block_start_y = pdf.get_y()
+    draw_calendar_marker(pdf, marker_x, block_start_y)
 
-            with ThreadPoolExecutor(max_workers=min(len(days), 8)) as executor:
-                futures = [executor.submit(fetch_day_images, i, day) for i, day in enumerate(days)]
-                for future in as_completed(futures):
-                    idx, result = future.result()
-                    day_images[idx] = result
-            
-            # Step 3: Generate PDF
-            progress.progress(80, text="Building PDF...")
-            pdf_bytes = create_pdf(itinerary, day_images)
-            
-            progress.progress(100, text="Done!")
-            
-            # Display results
-            st.success(f"Itinerary ready for {customer_name}!")
-            
-            # Hero card
-            date_range = f"{compact_date(start_date)} - {compact_date(end_date)}"
-            st.markdown(f"""
-            <div class="hero-card">
-                <h3 style="color:#f8fafc;margin:0;">{destination}</h3>
-                <p style="color:#93c5fd;margin:0.5rem 0;">{date_range}</p>
-                <p style="color:#cbd5e1;margin:0;">{len(days)} days • Professional PDF with verified images</p>
-            </div>
-            """, unsafe_allow_html=True)
-            
-            # Display days
-            for i, day in enumerate(days):
-                with st.container():
-                    st.markdown(f"""
-                    <div class="day-card">
-                        <h4 style="color:#f8fafc;margin:0;">{day.get('date_display', '')}</h4>
-                        <p style="color:#38bdf8;margin:0.2rem 0;font-weight:600;">{day.get('title', '')}</p>
-                        <p style="color:#e5e7eb;margin:0.3rem 0;"><strong>Morning:</strong> {day.get('morning', '')}</p>
-                        <p style="color:#e5e7eb;margin:0.3rem 0;"><strong>Afternoon:</strong> {day.get('afternoon', '')}</p>
-                        <p style="color:#e5e7eb;margin:0.3rem 0;"><strong>Evening:</strong> {day.get('evening', '')}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-            
-            # Download button
-            st.download_button(
-                label="Download PDF Itinerary",
-                data=BytesIO(pdf_bytes),
-                file_name=f"{destination.lower().replace(' ', '_')}_itinerary.pdf",
-                mime="application/pdf",
-            )
-            
-        except Exception as e:
-            st.error(f"Error generating itinerary: {str(e)}")
-            progress.empty()
+    pdf.set_xy(content_x, block_start_y - 1)
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.set_text_color(0, 0, 0)
+    pdf.cell(0, 5, safe_text(item["title"]))
+    pdf.ln(5)
+
+    places_text = ", ".join(normalize_places(item.get("places", [])))
+    draw_bullet_line(pdf, "Location", item.get("location", ""), content_x + 1)
+    draw_bullet_line(pdf, "Places", places_text, content_x + 1)
+
+    for label, content in [
+        ("Morning", item["morning"]),
+        ("Afternoon", item["afternoon"]),
+        ("Evening", item["evening"]),
+    ]:
+        draw_bullet_line(pdf, label, content, content_x + 1)
+
+    if image_paths:
+        image_y = pdf.get_y() + 3
+        last_y = draw_image_grid(pdf, image_paths, content_x, image_y)
+        pdf.set_y(last_y + 8)
+    else:
+        pdf.ln(8)
+
+    block_end_y = pdf.get_y()
+    pdf.set_draw_color(210, 220, 230)
+    pdf.line(marker_x, block_start_y + 8, marker_x, block_end_y - 2)
+
+def build_pdf(client: str, title: str, destination: str, start_date: date, end_date: date, days: list[dict]) -> bytes:
+    used_image_hashes: set[str] = set()
+    cover_path = get_cover_image(destination, used_image_hashes)
+    day_images = [
+        get_day_images(
+            destination,
+            item["title"],
+            item.get("location", destination),
+            item.get("places", []),
+            idx + 1,
+            used_image_hashes,
+        )
+        for idx, item in enumerate(days)
+    ]
+
+    pdf = TravelPlanPDF("P", "mm", "A4")
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(auto=True, margin=16)
+
+    draw_cover_page(pdf, client, title, start_date, end_date, cover_path)
+    draw_summary_page(pdf, days)
+
+    pdf.add_page()
+    pdf.set_y(12)
+    for idx, item in enumerate(days):
+        draw_day_block(pdf, item, day_images[idx])
+
+    output = pdf.output(dest="S")
+    if isinstance(output, str):
+        return output.encode("latin-1", errors="ignore")
+    if isinstance(output, bytearray):
+        return bytes(output)
+    return output
 
 
-if __name__ == "__main__":
-    main()
+st.markdown("<div class='main-header'>Ai <span>Travel</span> Plan</div>", unsafe_allow_html=True)
+
+with st.sidebar:
+    st.markdown("### Trip Details")
+    client_name = st.text_input("Client Name", "")
+    destination = st.text_input("Destination", "")
+    plan_title = st.text_input("Plan Title", "Travel Plan")
+    start_date = st.date_input("Departure", datetime.now().date())
+    end_date = st.date_input("Return", datetime.now().date() + timedelta(days=5))
+    generate = st.button("Create Travel Plan")
+
+if end_date < start_date:
+    st.error("Return date cannot be before departure date.")
+    st.stop()
+
+if generate:
+    if not destination.strip():
+        st.error("Please enter a destination before creating the travel plan.")
+        st.stop()
+
+    progress = st.progress(0)
+    status = st.empty()
+
+    status.write("Preparing travel plan...")
+    progress.progress(15)
+    itinerary_days = get_ai_plan(client_name, destination, start_date, end_date)
+
+    status.write("Creating PDF and collecting photos...")
+    progress.progress(55)
+    pdf_bytes = build_pdf(
+        client=client_name,
+        title=plan_title,
+        destination=destination,
+        start_date=start_date,
+        end_date=end_date,
+        days=itinerary_days,
+    )
+
+    progress.progress(100)
+    status.empty()
+    progress.empty()
+
+    st.download_button(
+        label="Download PDF",
+        data=BytesIO(pdf_bytes),
+        file_name=f"{slugify(destination)}_travel_plan.pdf",
+        mime="application/pdf",
+    )
