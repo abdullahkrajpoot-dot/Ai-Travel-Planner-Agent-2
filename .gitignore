@@ -6,6 +6,7 @@ __pycache__/
 .Python
 .streamlit/
 .tools/
+.vscode/
 app.py.backup
 New Text Document.txt
 scratch/
