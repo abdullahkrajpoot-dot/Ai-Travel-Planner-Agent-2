@@ -6,6 +6,13 @@ __pycache__/
 .Python
 .streamlit/
 .tools/
+app.py.backup
+New Text Document.txt
+scratch/
+test_images.py
+*.jpg
+*.png
+*.pdf
 *.tmp
 *.log
 Thumbs.db
