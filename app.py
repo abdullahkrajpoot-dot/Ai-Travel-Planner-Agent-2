@@ -159,6 +159,44 @@ def normalize_place_list(value) -> list[str]:
     return places[:4]
 
 
+def clean_day_title(title: str, idx: int) -> str:
+    title = safe_text(title)
+    title = re.sub(r"\bSignature\s+Highlights?\b", "Highlights", title, flags=re.IGNORECASE)
+    title = re.sub(r"\s+", " ", title).strip(" -")
+    return title or f"Day {idx + 1} Highlights"
+
+
+def apply_trip_day_rules(days: list[dict], destination: str) -> list[dict]:
+    if not days:
+        return days
+
+    for idx, day in enumerate(days):
+        day["title"] = clean_day_title(day.get("title", ""), idx)
+
+    days[0].update(
+        {
+            "title": "Arrival & Rest",
+            "morning": f"Arrive in {destination}, complete transfer formalities, and check in comfortably.",
+            "afternoon": "Take time to rest, unpack, and recover from the journey.",
+            "evening": "Keep the evening relaxed with no visits or sightseeing planned.",
+            "places": [],
+        }
+    )
+
+    if len(days) > 1:
+        days[-1].update(
+            {
+                "title": "Departure",
+                "morning": "Pack, check out, and prepare for the return journey.",
+                "afternoon": "Depart for the return trip with no visits or sightseeing planned.",
+                "evening": "Continue the journey back home or onward as per schedule.",
+                "places": [],
+            }
+        )
+
+    return days
+
+
 WIKI_HEADERS = {
     "User-Agent": "AI-Travel-Planner/1.0 (+https://github.com/abdullahkrajpoot-dot/Ai-Travel-Planner-Agent)",
     "Accept": "application/json",
@@ -680,11 +718,11 @@ def fallback_plan(destination: str, start_date: date, end_date: date):
         current_date = start_date + timedelta(days=idx)
         places = templates[idx % len(templates)]
         if idx == 0:
-            title = "Arrival & First Impressions"
+            title = "Arrival & Rest"
         elif idx == total_days - 1:
-            title = "Departure Day"
+            title = "Departure"
         else:
-            title = f"Day {idx + 1} Signature Highlights"
+            title = f"Day {idx + 1} Highlights"
         days.append(
             {
                 "date": current_date,
@@ -695,7 +733,7 @@ def fallback_plan(destination: str, start_date: date, end_date: date):
                 "places": places,
             }
         )
-    return days
+    return apply_trip_day_rules(days, destination)
 
 
 def parse_ai_plan(raw_text: str, destination: str, start_date: date, end_date: date):
@@ -713,7 +751,7 @@ def parse_ai_plan(raw_text: str, destination: str, start_date: date, end_date: d
         normalized.append(
             {
                 "date": expected_dates[idx],
-                "title": safe_text(item.get("title") or f"Day {idx + 1} Highlights"),
+                "title": clean_day_title(item.get("title") or f"Day {idx + 1} Highlights", idx),
                 "morning": safe_text(item.get("morning", "")),
                 "afternoon": safe_text(item.get("afternoon", "")),
                 "evening": safe_text(item.get("evening", "")),
@@ -737,7 +775,7 @@ def parse_ai_plan(raw_text: str, destination: str, start_date: date, end_date: d
                 day["places"].append(place)
                 used_plan_places.add(place)
 
-    return normalized
+    return apply_trip_day_rules(normalized, destination)
 
 
 def get_ai_plan(client: str, destination: str, start_date: date, end_date: date):
@@ -758,19 +796,23 @@ Rules:
 - Return JSON only.
 - Root object must be {{ "days": [ ... ] }}.
 - Include exactly {total_days} day objects.
+- First day must be arrival and rest only, with no sightseeing visits.
+- Last day must be departure/return only, with no sightseeing visits.
+- First and last day "places" must be an empty array.
 - Each day object must contain:
   - "title"
   - "morning"
   - "afternoon"
   - "evening"
   - "places"
-- "places" must be an array of 3 or 4 real, specific place names strongly related to that day's activities.
+- For middle sightseeing days, "places" must be an array of 3 or 4 real, specific place names strongly related to that day's activities.
 - Place names should be exact enough for image search, like "Badshahi Mosque, Lahore" not generic terms like "city center".
 - Do not repeat the same place on another day unless the trip is longer than the destination's available attractions.
 - Each day's morning, afternoon, and evening text must describe that same day's places.
 - Use visitor attractions only: mosques, museums, mountains, caves, parks, markets, towers, monuments, heritage sites, viewpoints, and malls.
 - Do not include events, incidents, attacks, battles, seizures, wars, disasters, hotels, airports, or railway stations as places.
 - Keep the itinerary realistic and tourist-friendly.
+- Do not use the phrase "Signature Highlight" or "Signature Highlights".
 """
 
     try:
@@ -791,7 +833,7 @@ Rules:
         return fallback_plan(destination, start_date, end_date)
 
 
-def save_pdf_ready_image(content: bytes) -> str | None:
+def save_pdf_ready_image(content: bytes, max_width: int = 1000, max_height: int = 750) -> str | None:
     try:
         image = Image.open(BytesIO(content))
         image.load()
@@ -801,8 +843,9 @@ def save_pdf_ready_image(content: bytes) -> str | None:
             image = image.convert("RGB")
         elif image.mode == "L":
             image = image.convert("RGB")
+        image.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-            image.save(temp_file.name, format="JPEG", quality=88, optimize=True)
+            image.save(temp_file.name, format="JPEG", quality=88, optimize=True, progressive=True)
             return temp_file.name
     except (UnidentifiedImageError, OSError, ValueError):
         return None
@@ -810,11 +853,11 @@ def save_pdf_ready_image(content: bytes) -> str | None:
 
 def create_text_image(place_name: str, destination: str | None = None) -> str | None:
     try:
-        image = Image.new("RGB", (1200, 800), (235, 239, 244))
+        image = Image.new("RGB", (1000, 667), (235, 239, 244))
         draw = ImageDraw.Draw(image)
-        draw.rectangle((0, 0, 1200, 800), fill=(235, 239, 244))
-        draw.rectangle((0, 0, 1200, 160), fill=(22, 48, 86))
-        draw.rectangle((70, 220, 1130, 700), outline=(150, 163, 184), width=4)
+        draw.rectangle((0, 0, 1000, 667), fill=(235, 239, 244))
+        draw.rectangle((0, 0, 1000, 134), fill=(22, 48, 86))
+        draw.rectangle((58, 183, 942, 583), outline=(150, 163, 184), width=4)
     except Exception:
         return None
 
@@ -828,16 +871,16 @@ def create_text_image(place_name: str, destination: str | None = None) -> str | 
     try:
         safe_place = safe_text(place_name) or "Travel Highlight"
         safe_destination = safe_text(destination or "")
-        draw.text((70, 52), "Travel Highlight", fill=(255, 255, 255), font=title_font)
+        draw.text((58, 43), "Travel Highlight", fill=(255, 255, 255), font=title_font)
         wrapped_place = wrap_text(safe_place, 34)
-        y = 280
+        y = 233
         for line in wrapped_place:
-            draw.text((110, y), line, fill=(15, 23, 42), font=body_font)
+            draw.text((92, y), line, fill=(15, 23, 42), font=body_font)
             y += 54
         if safe_destination:
-            draw.text((110, 620), safe_destination, fill=(71, 85, 105), font=body_font)
+            draw.text((92, 517), safe_destination, fill=(71, 85, 105), font=body_font)
         with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as temp_file:
-            image.save(temp_file.name, format="JPEG", quality=88, optimize=True)
+            image.save(temp_file.name, format="JPEG", quality=88, optimize=True, progressive=True)
             return temp_file.name
     except Exception:
         return None
@@ -1379,6 +1422,7 @@ def draw_day_block(pdf: TravelPlanPDF, item: dict, image_entries: list[dict]):
 
 def build_pdf(client: str, title: str, destination: str, start_date: date, end_date: date, days: list[dict], cover_path: str | None, day_images: list[list[dict]]) -> bytes:
     pdf = TravelPlanPDF("P", "mm", "A4")
+    pdf.set_compression(True)
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=16)
     draw_cover_page(pdf, client, title, destination, start_date, end_date, cover_path)

@@ -1,35 +1,67 @@
-# 🌍 Ali Baba Travel Advisor - V3
-A professional AI-powered Visa Eligibility Checker and Travel Experience Designer built with **Python** and **Streamlit**.
+# AI Travel Planner Agent
 
-## 🚀 Overview
-This application helps travel agents and customers quickly assess visa success probabilities based on financial and personal data. It also features an AI-driven travel designer to create premium itineraries.
+A professional Streamlit app for generating travel itineraries and downloadable PDF travel plans.
 
-## ✨ Key Features
-- **Visa Probability Score:** Calculates a success percentage based on income, bank statements, and travel history.
-- **Dynamic Dashboard:** A premium Red & Navy themed UI inspired by professional travel portals.
-- **AI Travel Designer:** Generates personalized trip highlights for different destinations.
-- **Interactive UI:** Built using Streamlit components like tabs, columns, and custom CSS.
+## Overview
 
-## 🛠️ Tech Stack
+This application helps travel agents create clean, day-by-day travel plans for clients. It generates itinerary titles, daily activities, destination places, image-based PDF pages, and a polished downloadable travel plan.
+
+## Key Features
+
+- **AI Travel Itinerary:** Creates day-wise travel plans from client, destination, and travel dates.
+- **Arrival & Departure Rules:** First day is arrival/rest only, and last day is departure only with no visits.
+- **Middle-Day Sightseeing:** Sightseeing places and images are used only for the main travel days.
+- **PDF Download:** Generates a professional PDF travel plan with optimized image handling for smaller file size.
+- **Streamlit Interface:** Simple local web app for entering trip details and downloading the final plan.
+
+## Tech Stack
+
 - **Language:** Python 3.x
 - **Framework:** Streamlit
-- **Styling:** Custom CSS & HTML Injection
-- **Environment:** Virtual Environments (.venv)
+- **PDF:** fpdf2
+- **Images:** Pillow
+- **Web Requests:** requests
 
-## 📦 Installation & Setup
-To run this project locally, follow these steps:
+## Installation & Setup
 
-1. **Clone the repository:**
+1. Create and activate a virtual environment:
+
    ```bash
-   git clone [https://github.com/abdullahkrajpoot-dot/Ai-Travel-Planner-Agent.git](https://github.com/abdullahkrajpoot-dot/Ai-Travel-Planner-Agent.git)
-   cd Ai-Travel-Planner-Agent
-2. **Create and Activate Virtual Environment:**
    python -m venv .venv
-# Windows:
-.\.venv\Scripts\activate
-# Mac/Linux:
-source .venv/bin/activate
-3. **Install Dependencies:**
-pip install streamlit
-4. **Run the Application:**
-streamlit run app.py
+   ```
+
+   Windows:
+
+   ```bash
+   .\.venv\Scripts\activate
+   ```
+
+   Mac/Linux:
+
+   ```bash
+   source .venv/bin/activate
+   ```
+
+2. Install dependencies:
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+3. Run the application:
+
+   ```bash
+   streamlit run app.py
+   ```
+
+4. Open the local app:
+
+   ```text
+   http://127.0.0.1:8501
+   ```
+
+## Local Helper Scripts
+
+- `start_localhost.bat` starts the Streamlit app on localhost.
+- `start_localhost_hidden.vbs` starts the app in a hidden window.
+- `stop_localhost_hidden.vbs` stops the hidden localhost server.
